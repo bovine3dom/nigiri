@@ -5,13 +5,12 @@
 #include <memory>
 #include <ostream>
 #include <string>
-#include <system_error>
-#include <utility>
 #include <vector>
 
-#include "nigiri/timetable.h"
-
 namespace nigiri {
+
+struct timetable;
+struct shapes_storage;
 
 struct gtfs_export_target {
   virtual ~gtfs_export_target() = default;
@@ -55,26 +54,8 @@ struct gtfs_zip_export_target : public gtfs_export_target {
 std::unique_ptr<gtfs_export_target> make_gtfs_export_target(
     std::filesystem::path const& output_path);
 
-void export_gtfs(timetable const& tt, std::filesystem::path const& output_path);
-
-void write_feed_info(gtfs_export_target& out);
-
-void write_agencies(timetable const& tt, gtfs_export_target& out);
-
-void write_stops(timetable const& tt, gtfs_export_target& out);
-
-void write_stop_times(timetable const& tt, gtfs_export_target& out);
-
-void write_trips(timetable const& tt,
-                 gtfs_export_target& out,
-                 std::vector<size_t> const& route_offsets);
-
-void write_routes(timetable const& tt,
-                  gtfs_export_target& out,
-                  std::vector<size_t> const& route_offsets);
-
-void write_calendar(timetable const& tt, gtfs_export_target& out);
-
-void write_transfers(timetable const& tt, gtfs_export_target& out);
+void export_gtfs(timetable const& tt,
+                 std::filesystem::path const& output_path,
+                 shapes_storage const* shapes = nullptr);
 
 }  // namespace nigiri

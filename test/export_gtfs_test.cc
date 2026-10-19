@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string>
@@ -14,8 +15,11 @@
 #include "nigiri/loader/netex/load_timetable.h"
 #include "nigiri/export_gtfs.h"
 #include "nigiri/rt/frun.h"
+#include "nigiri/shapes_storage.h"
 #include "nigiri/special_stations.h"
+
 #include "nigiri/timetable.h"
+#include "../src/gtfs_export/shape.h"
 
 #include "test_dir.h"
 
@@ -76,13 +80,40 @@ constexpr auto kDateRange =
     interval{sys_days{2019_y / May / 1}, sys_days{2019_y / June / 1}};
 
 timetable load(loader::dir const& d,
-               interval<sys_days> const dates = kDateRange) {
+               interval<sys_days> const dates = kDateRange,
+               shapes_storage* shapes = nullptr) {
   auto tt = timetable{};
   tt.date_range_ = dates;
   loader::register_special_stations(tt);
-  loader::gtfs::load_timetable({}, source_idx_t{0}, d, tt);
+  loader::gtfs::load_timetable({}, source_idx_t{0}, d, tt, nullptr, shapes);
   loader::finalize(tt);
   return tt;
+}
+
+void add_shared_shape(timetable const& tt,
+                      shapes_storage& storage,
+                      std::vector<geo::latlng> const& points,
+                      std::vector<shape_offset_t> const& offsets = {
+                          shape_offset_t{0}, shape_offset_t{1},
+                          shape_offset_t{2}}) {
+  auto const shape = to_scoped_shape_idx(shape_idx_t{storage.data_.size()},
+                                         shape_source::kTimetable);
+  storage.data_.emplace_back(points);
+  auto const offset = storage.add_offsets(offsets);
+  for (auto trip = trip_idx_t{0}; trip != tt.n_trips(); ++trip) {
+    storage.add_trip_shape_offsets(trip, {shape, offset});
+  }
+}
+
+void expect_empty_last_column(loader::dir const& dir, char const* file) {
+  auto const data = dir.get_file(file);
+  auto lines = std::istringstream{std::string{data.data()}};
+  auto line = std::string{};
+  std::getline(lines, line);
+  while (std::getline(lines, line)) {
+    ASSERT_FALSE(line.empty());
+    EXPECT_EQ(',', line.back());
+  }
 }
 
 std::string_view root_name(timetable const& tt, location_idx_t const l) {
@@ -186,6 +217,191 @@ struct export_gtfs_test : testing::TestWithParam<bool> {
 
 }  // namespace
 
+TEST_P(export_gtfs_test, shape_slices) {
+  auto const tt = load(loader::mem_dir::read(kFeed));
+  auto storage =
+      shapes_storage{root_ / "shapes", cista::mmap::protection::WRITE};
+  auto const points = std::vector<geo::latlng>{
+      {49.0, 8.0}, {50.0, 8.0}, {50.0, 8.0}, {51.0, 8.0}, {49.0, 8.0}};
+  storage.data_.emplace_back(points);
+  storage.routed_data_.emplace_back(points);
+  auto const offsets = storage.add_offsets(
+      {shape_offset_t{0}, shape_offset_t{2}, shape_offset_t{4}});
+  auto const trip = trip_idx_t{0};
+  auto const [transport, range] = tt.trip_transport_ranges_[trip].front();
+  ASSERT_EQ(3U, range.size());
+  auto const publisher =
+      to_scoped_shape_idx(shape_idx_t{0}, shape_source::kTimetable);
+  auto const routed =
+      to_scoped_shape_idx(shape_idx_t{0}, shape_source::kRouted);
+  storage.add_trip_shape_offsets(trip, {publisher, offsets});
+  auto resolve = [&]() {
+    return gtfs_export::resolve_shape(tt, storage, transport, trip, range);
+  };
+  auto const full = resolve();
+  ASSERT_EQ(gtfs_export::shape_status::kValid, full.status_);
+  EXPECT_EQ(5U, full.points_.size());
+  EXPECT_EQ(3U, full.stop_distances_.size());
+  EXPECT_EQ(0.0, full.stop_distances_.front());
+  EXPECT_GT(full.stop_distances_.back(), full.stop_distances_[1]);
+  EXPECT_EQ(full.distances_[1], full.distances_[2]);
+  auto const clipped = gtfs_export::resolve_shape(
+      tt, storage, transport, trip,
+      {static_cast<stop_idx_t>(range.from_ + 1U), range.to_});
+  ASSERT_EQ(gtfs_export::shape_status::kValid, clipped.status_);
+  EXPECT_EQ(3U, clipped.points_.size());
+  EXPECT_EQ(0.0, clipped.stop_distances_.front());
+  EXPECT_NE(full.id_, clipped.id_);
+  storage.trip_offset_indices_[trip].first = routed;
+  EXPECT_NE(full.id_, resolve().id_);
+  for (auto const& equal :
+       {std::vector<shape_offset_t>{shape_offset_t{0}, shape_offset_t{0},
+                                    shape_offset_t{4}},
+        std::vector<shape_offset_t>{shape_offset_t{1}, shape_offset_t{2},
+                                    shape_offset_t{4}}}) {
+    storage.trip_offset_indices_[trip].second = storage.add_offsets(equal);
+    auto const slice = resolve();
+    EXPECT_EQ(gtfs_export::shape_status::kValid, slice.status_);
+    EXPECT_FALSE(slice.points_.empty());
+    EXPECT_TRUE(slice.stop_distances_.empty());
+  }
+  storage.trip_offset_indices_[trip].second = storage.add_offsets(
+      {shape_offset_t{0}, shape_offset_t{4}, shape_offset_t{2}});
+  EXPECT_EQ(gtfs_export::shape_status::kOffsets, resolve().status_);
+  storage.trip_offset_indices_[trip].second = storage.add_offsets(
+      {shape_offset_t{0}, shape_offset_t{2}, shape_offset_t{5}});
+  EXPECT_EQ(gtfs_export::shape_status::kOffsets, resolve().status_);
+  storage.trip_offset_indices_[trip].second = shape_offset_idx_t::invalid();
+  EXPECT_EQ(gtfs_export::shape_status::kOffsets, resolve().status_);
+  storage.trip_offset_indices_[trip].first = scoped_shape_idx_t::invalid();
+  EXPECT_EQ(gtfs_export::shape_status::kMissing, resolve().status_);
+  storage.trip_offset_indices_[trip] = {publisher, offsets};
+  storage.data_[shape_idx_t{0}][2].lat_ =
+      std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(gtfs_export::shape_status::kGeometry, resolve().status_);
+  for (auto& p : storage.data_[shape_idx_t{0}]) {
+    p = points.front();
+  }
+  EXPECT_EQ(gtfs_export::shape_status::kGeometry, resolve().status_);
+  EXPECT_EQ(gtfs_export::shape_status::kTripRange,
+            gtfs_export::resolve_shape(tt, storage, transport_idx_t::invalid(),
+                                       trip, range)
+                .status_);
+}
+
+TEST_P(export_gtfs_test, equal_stop_distances) {
+  auto const tt = load(loader::mem_dir::read(kFeed));
+  auto shapes =
+      shapes_storage{root_ / "shapes", cista::mmap::protection::WRITE};
+  add_shared_shape(tt, shapes, {{49.0, 8.0}, {49.0, 8.0}, {50.0, 8.0}});
+  export_gtfs(tt, output(), &shapes);
+  auto const exported = loader::make_dir(output());
+  EXPECT_EQ(trip_events(tt), trip_events(load(*exported)));
+  EXPECT_NE(std::string_view::npos,
+            exported->get_file("trips.txt").data().find(",0_0_2\n"));
+  expect_empty_last_column(*exported, "stop_times.txt");
+}
+
+TEST_P(export_gtfs_test, small_shape_values) {
+  auto const tt = load(loader::mem_dir::read(kFeed));
+  auto shapes =
+      shapes_storage{root_ / "shapes", cista::mmap::protection::WRITE};
+  auto const points =
+      std::vector<geo::latlng>{{0.0, 0.0}, {1e-12, 2e-12}, {2e-12, 4e-12}};
+  add_shared_shape(tt, shapes, points);
+  export_gtfs(tt, output(), &shapes);
+  auto const exported = loader::make_dir(output());
+  auto const data = exported->get_file("shapes.txt");
+  auto const rows = data.data().substr(data.data().find('\n') + 1U);
+  EXPECT_EQ(std::string_view::npos, rows.find_first_of("eE"));
+  auto imported_shapes =
+      shapes_storage{root_ / "imported-shapes", cista::mmap::protection::WRITE};
+  auto const imported = load(*exported, kDateRange, &imported_shapes);
+  ASSERT_EQ(1U, imported_shapes.data_.size());
+  auto const actual = imported_shapes.data_[shape_idx_t{0}];
+  ASSERT_EQ(points.size(), actual.size());
+  for (auto i = 0U; i != points.size(); ++i) {
+    EXPECT_DOUBLE_EQ(points[i].lat_, actual[i].lat_);
+    EXPECT_DOUBLE_EQ(points[i].lng_, actual[i].lng_);
+  }
+  for (auto const& [shape, offset] : imported_shapes.trip_offset_indices_) {
+    auto const actual_offsets = imported_shapes.offsets_[offset];
+    ASSERT_EQ(3U, actual_offsets.size());
+    for (auto i = 0U; i != 3U; ++i) {
+      EXPECT_EQ(shape_offset_t{i}, actual_offsets[i]);
+    }
+  }
+}
+
+TEST_P(export_gtfs_test, shapes_export) {
+  auto const tt = load(loader::mem_dir::read(kFeed));
+  auto storage =
+      shapes_storage{root_ / "shapes", cista::mmap::protection::WRITE};
+  auto const points = std::vector<geo::latlng>{
+      {49.0, 8.0}, {50.0, 8.0}, {50.0, 8.0}, {51.0, 8.0}, {49.0, 8.0}};
+  add_shared_shape(tt, storage, points,
+                   {shape_offset_t{0}, shape_offset_t{2}, shape_offset_t{4}});
+  storage.routed_data_.emplace_back(points);
+  for (auto const mode : {"shared"sv, "routed"sv, "invalid"sv}) {
+    SCOPED_TRACE(mode);
+    if (mode == "routed") {
+      storage.trip_offset_indices_[trip_idx_t{1}].first =
+          to_scoped_shape_idx(shape_idx_t{0}, shape_source::kRouted);
+    } else if (mode == "invalid") {
+      for (auto& entry : storage.trip_offset_indices_) {
+        entry.second = shape_offset_idx_t::invalid();
+      }
+    }
+    auto const dir = root_ / mode;
+    auto const path = dir / output().filename();
+    export_gtfs(tt, path, &storage);
+    auto const exported = loader::make_dir(path);
+    EXPECT_EQ(trip_events(tt), trip_events(load(*exported)));
+    auto expected = std::string{
+        "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence,"
+        "shape_dist_traveled\n"};
+    if (mode != "invalid") {
+      auto const d = geo::distance(points[0], points[1]);
+      for (auto source : {shape_source::kTimetable, shape_source::kRouted}) {
+        if (source == shape_source::kRouted && mode == "shared") {
+          continue;
+        }
+        auto const id = std::format(
+            "{}_0_4", to_idx(to_scoped_shape_idx(shape_idx_t{0}, source)));
+        expected += std::format(
+            "{0},49,8,0,0\n{0},50,8,1,{1}\n"
+            "{0},51,8,2,{2}\n{0},49,8,3,{3}\n",
+            id, d, d + geo::distance(points[2], points[3]),
+            d + geo::distance(points[2], points[3]) +
+                geo::distance(points[3], points[4]));
+      }
+    }
+    EXPECT_EQ(expected, exported->get_file("shapes.txt").data());
+    if (mode != "invalid") {
+      auto imported_shapes = shapes_storage{dir / "imported-shapes",
+                                            cista::mmap::protection::WRITE};
+      auto const imported = load(*exported, kDateRange, &imported_shapes);
+      ASSERT_EQ(tt.n_trips(), imported.n_trips());
+      for (auto trip = trip_idx_t{0}; trip != imported.n_trips(); ++trip) {
+        auto const shape = imported_shapes.get_shape(trip);
+        ASSERT_EQ(4U, shape.size());
+        EXPECT_EQ(points.front(), shape.front());
+        EXPECT_EQ(points.back(), shape.back());
+        auto const [index, offset] = imported_shapes.trip_offset_indices_[trip];
+        auto const stops = imported_shapes.offsets_[offset];
+        ASSERT_EQ(3U, stops.size());
+        EXPECT_EQ(shape_offset_t{0}, stops[0]);
+        EXPECT_EQ(shape_offset_t{1}, stops[1]);
+        EXPECT_EQ(shape_offset_t{3}, stops[2]);
+      }
+    }
+    if (mode == "invalid") {
+      expect_empty_last_column(*exported, "trips.txt");
+      expect_empty_last_column(*exported, "stop_times.txt");
+    }
+  }
+}
+
 TEST_P(export_gtfs_test, round_trip) {
   auto const tt = load(loader::mem_dir::read(kFeed));
 
@@ -199,7 +415,11 @@ TEST_P(export_gtfs_test, round_trip) {
       tt.get_default_translation(tt.route_ids_[source_idx_t{0}]
                                      .route_id_long_names_[route_id_idx_t{0}]));
 
-  export_gtfs(tt, output());
+  auto const tt_path = root_ / "tt.bin";
+  tt.write(tt_path);
+  auto stored = timetable::read(tt_path);
+  stored->resolve();
+  export_gtfs(*stored, output());
 
   auto const tt2 = load(*loader::make_dir(output()));
 
@@ -379,6 +599,16 @@ TEST_P(export_gtfs_test, section_flags_without_trip_change) {
   auto const tt2 = load(*loader::make_dir(output()));
   EXPECT_EQ(3U, tt2.trip_ids_.size());
   EXPECT_EQ(expected, trip_events(tt2));
+
+  auto shapes =
+      shapes_storage{root_ / "shapes", cista::mmap::protection::WRITE};
+  add_shared_shape(tt, shapes, {{49.0, 8.0}, {50.0, 8.0}, {51.0, 8.0}});
+  auto const path = root_ / "shaped" / output().filename();
+  export_gtfs(tt, path, &shapes);
+  auto const data = loader::make_dir(path)->get_file("trips.txt");
+  EXPECT_NE(std::string_view::npos, data.data().find(",0_0_1\n"));
+  EXPECT_NE(std::string_view::npos, data.data().find(",0_1_2\n"));
+  EXPECT_EQ(expected, trip_events(load(*loader::make_dir(path))));
 }
 
 TEST_P(export_gtfs_test, through_service) {
@@ -414,6 +644,43 @@ TEST_P(export_gtfs_test, through_service) {
     auto const tt2 = load(*loader::make_dir(path));
     EXPECT_EQ(2U, tt2.trip_ids_.size());
     EXPECT_EQ(expected, trip_events(tt2));
+
+    auto shapes = shapes_storage{root_ / std::format("shapes-{}", hour),
+                                 cista::mmap::protection::WRITE};
+    for (auto trip = trip_idx_t{0}; trip != tt.n_trips(); ++trip) {
+      auto const [transport, range] = tt.trip_transport_ranges_[trip].front();
+      auto const stops = tt.route_location_seq_[tt.transport_route_[transport]];
+      auto points = std::vector<geo::latlng>{};
+      auto offsets = std::vector<shape_offset_t>{};
+      for (auto s = range.from_; s != range.to_; ++s) {
+        offsets.emplace_back(points.size());
+        points.push_back(
+            tt.locations_.coordinates_[stop{stops[s]}.location_idx()]);
+      }
+      auto const index = shape_idx_t{shapes.routed_data_.size()};
+      shapes.routed_data_.emplace_back(points);
+      shapes.add_trip_shape_offsets(
+          trip, {to_scoped_shape_idx(index, shape_source::kRouted),
+                 shapes.add_offsets(offsets)});
+      auto const slice =
+          gtfs_export::resolve_shape(tt, shapes, transport, trip, range);
+      ASSERT_EQ(gtfs_export::shape_status::kValid, slice.status_);
+      EXPECT_EQ(points, std::vector(begin(slice.points_), end(slice.points_)));
+      EXPECT_EQ(0.0, slice.stop_distances_.front());
+    }
+    auto const shaped_path =
+        root_ / std::format("shaped-{}", hour) / output().filename();
+    export_gtfs(tt, shaped_path, &shapes);
+    auto imported_shapes =
+        shapes_storage{root_ / std::format("imported-shapes-{}", hour),
+                       cista::mmap::protection::WRITE};
+    auto const imported =
+        load(*loader::make_dir(shaped_path), kDateRange, &imported_shapes);
+    EXPECT_EQ(expected, trip_events(imported));
+    EXPECT_EQ(2U, imported_shapes.data_.size());
+    for (auto trip = trip_idx_t{0}; trip != imported.n_trips(); ++trip) {
+      EXPECT_EQ(3U, imported_shapes.get_shape(trip).size());
+    }
   }
 }
 
@@ -491,8 +758,12 @@ TEST_P(export_gtfs_test, directory_zip_equivalence) {
   auto const tt = load(loader::mem_dir::read(kFeed));
   auto const directory = root_ / "directory";
   auto const zip = root_ / "archive.zip";
-  export_gtfs(tt, directory);
-  export_gtfs(tt, zip);
+  auto shapes =
+      shapes_storage{root_ / "shapes", cista::mmap::protection::WRITE};
+  add_shared_shape(tt, shapes, {{49.0, 8.0}, {50.0, 8.0}, {51.0, 8.0}});
+  auto const storage = GetParam() ? &shapes : nullptr;
+  export_gtfs(tt, directory, storage);
+  export_gtfs(tt, zip, storage);
   auto const files = loader::fs_dir{directory};
   auto const archive = loader::zip_dir{zip};
   EXPECT_EQ(files.list_files({}).size(), archive.list_files({}).size());

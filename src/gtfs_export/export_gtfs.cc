@@ -1,6 +1,7 @@
 #include "nigiri/export_gtfs.h"
 
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <algorithm>
 #include <array>
@@ -8,8 +9,12 @@
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
 #include <string_view>
+#include <unordered_set>
+
+#include "shape.h"
 
 #include "miniz.h"
 
@@ -291,30 +296,67 @@ void for_each_exported_trip(timetable const& tt, Fn&& fn) {
   }
 }
 
-}  // namespace
+gtfs_export::shape_slice shape_for(timetable const& tt,
+                                   shapes_storage const* shapes,
+                                   exported_trip const& trip) {
+  return shapes == nullptr
+             ? gtfs_export::shape_slice{}
+             : gtfs_export::resolve_shape(tt, *shapes, trip.transport_,
+                                          trip.trip_, trip.stops_);
+}
 
-void export_gtfs(timetable const& tt,
-                 std::filesystem::path const& output_path) {
-  auto target = make_gtfs_export_target(output_path);
+std::string format_decimal(double const value) {
+  // Fixed notation, with the shortest representation that round-trips.
+  // Some GTFS consumers do not support scientific notation.
+  char buffer[512];
+  auto const [end, ec] = std::to_chars(std::begin(buffer), std::end(buffer),
+                                       value, std::chars_format::fixed);
+  utl::verify(ec == std::errc{}, "Cannot format shape value {}", value);
+  return {buffer, end};
+}
 
-  auto route_offsets = std::vector<size_t>(tt.route_ids_.size());
-  auto sum = std::size_t{0};
-
-  for (auto s = source_idx_t{0}; s < tt.route_ids_.size(); ++s) {
-    route_offsets[to_idx(s)] = sum;
-    sum += tt.route_ids_[s].ids_.size();
-  }
-
-  write_feed_info(*target);
-  write_agencies(tt, *target);
-  write_stops(tt, *target);
-  write_routes(tt, *target, route_offsets);
-  write_trips(tt, *target, route_offsets);
-  write_stop_times(tt, *target);
-  write_calendar(tt, *target);
-  write_transfers(tt, *target);
-
-  target->finalize();
+void write_shapes(timetable const& tt,
+                  gtfs_export_target& target,
+                  shapes_storage const& shapes) {
+  auto const timer = progress_timer{"shapes.txt"};
+  auto& out = target.create_file("shapes.txt");
+  out << "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence,"
+         "shape_dist_traveled\n";
+  auto seen = std::unordered_set<std::string>{};
+  using enum gtfs_export::shape_status;
+  auto counts = std::map<gtfs_export::shape_status, std::size_t>{};
+  auto publisher = std::size_t{0};
+  auto routed = std::size_t{0};
+  auto without_distances = std::size_t{0};
+  for_each_exported_trip(tt, [&](exported_trip const& trip) {
+    auto const shape = shape_for(tt, &shapes, trip);
+    ++counts[shape.status_];
+    if (shape.status_ != kValid) {
+      return;
+    }
+    ++(get_shape_source(shape.source_) == shape_source::kRouted ? routed
+                                                                : publisher);
+    without_distances += shape.stop_distances_.empty() ? 1U : 0U;
+    if (!seen.emplace(shape.id_).second) {
+      return;
+    }
+    auto seq = 0U;
+    for (auto i = 0U; i != shape.points_.size(); ++i) {
+      // Keep distances strictly increasing without changing stop offsets.
+      if (i != 0U && shape.distances_[i] == shape.distances_[i - 1U]) {
+        continue;
+      }
+      auto const p = shape.points_[i];
+      out << std::format("{},{},{},{},{}\n", shape.id_, format_decimal(p.lat_),
+                         format_decimal(p.lng_), seq++,
+                         format_decimal(shape.distances_[i]));
+    }
+  });
+  std::cout << std::format(
+      "trips: {} publisher, {} routed, {} missing; omitted: {} trip range, "
+      "{} offsets, {} geometry; {} shapes, {} trips without stop distances. ",
+      publisher, routed, counts[kMissing], counts[kTripRange], counts[kOffsets],
+      counts[kGeometry], seen.size(), without_distances);
 }
 
 void write_feed_info(gtfs_export_target& out_target) {
@@ -417,14 +459,18 @@ void write_stops(timetable const& tt, gtfs_export_target& out_target) {
   }
 }
 
-void write_stop_times(timetable const& tt, gtfs_export_target& out_target) {
+void write_stop_times(timetable const& tt,
+                      gtfs_export_target& out_target,
+                      shapes_storage const* shapes) {
   auto const timer = progress_timer{"stop_times.txt"};
 
   auto& out = out_target.create_file("stop_times.txt");
   out << "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
-         "stop_headsign,pickup_type,drop_off_type\n";
+         "stop_headsign,pickup_type,drop_off_type";
+  out << (shapes != nullptr ? ",shape_dist_traveled\n" : "\n");
 
   for_each_exported_trip(tt, [&](exported_trip const& trip) {
+    auto const shape = shape_for(tt, shapes, trip);
     auto const t = trip.transport_;
     auto const stops = tt.route_location_seq_[tt.transport_route_[t]];
     auto const last = static_cast<stop_idx_t>(trip.stops_.to_ - 1U);
@@ -443,19 +489,29 @@ void write_stop_times(timetable const& tt, gtfs_export_target& out_target) {
       out << id << "," << format_time(arr) << "," << format_time(dep) << ","
           << stop_id(stp.location_idx()) << "," << (s - trip.stops_.from_)
           << "," << csv_escape(headsign) << "," << (stp.in_allowed() ? 0 : 1)
-          << "," << (stp.out_allowed() ? 0 : 1) << "\n";
+          << "," << (stp.out_allowed() ? 0 : 1);
+      if (shapes != nullptr) {
+        out << ",";
+        if (shape.status_ == gtfs_export::shape_status::kValid &&
+            !shape.stop_distances_.empty()) {
+          out << format_decimal(shape.stop_distances_[s - trip.stops_.from_]);
+        }
+      }
+      out << "\n";
     }
   });
 }
 
 void write_trips(timetable const& tt,
                  gtfs_export_target& out_target,
-                 std::vector<size_t> const& route_offsets) {
+                 std::vector<size_t> const& route_offsets,
+                 shapes_storage const* shapes) {
   auto const timer = progress_timer{"trips.txt"};
 
   auto& out = out_target.create_file("trips.txt");
   out << "route_id,service_id,trip_id,trip_headsign,trip_short_name,"
-         "wheelchair_accessible,bikes_allowed,cars_allowed,block_id\n";
+         "wheelchair_accessible,bikes_allowed,cars_allowed,block_id";
+  out << (shapes != nullptr ? ",shape_id\n" : "\n");
 
   for_each_exported_trip(tt, [&](exported_trip const& trip) {
     auto const t = trip.transport_;
@@ -479,7 +535,14 @@ void write_trips(timetable const& tt,
                tt.get_default_translation(tt.trip_short_names_[trip.trip_]))
         << "," << flag(kWheelchairAccessible) << "," << flag(kBikesAllowed)
         << "," << flag(kCarsAllowed) << ","
-        << (trip.split_ ? std::to_string(to_idx(t)) : "") << "\n";
+        << (trip.split_ ? std::to_string(to_idx(t)) : "");
+    if (shapes != nullptr) {
+      auto const shape = shape_for(tt, shapes, trip);
+      out << ","
+          << (shape.status_ == gtfs_export::shape_status::kValid ? shape.id_
+                                                                 : "");
+    }
+    out << "\n";
   });
 }
 
@@ -664,4 +727,31 @@ void write_calendar(timetable const& tt, gtfs_export_target& out_target) {
     }
   }
 }
+}  // namespace
+
+void export_gtfs(timetable const& tt,
+                 std::filesystem::path const& output_path,
+                 shapes_storage const* shapes) {
+  auto target = make_gtfs_export_target(output_path);
+  auto route_offsets = std::vector<std::size_t>(tt.route_ids_.size());
+  auto sum = std::size_t{0};
+  for (auto s = source_idx_t{0}; s < tt.route_ids_.size(); ++s) {
+    route_offsets[to_idx(s)] = sum;
+    sum += tt.route_ids_[s].ids_.size();
+  }
+
+  write_feed_info(*target);
+  write_agencies(tt, *target);
+  write_stops(tt, *target);
+  write_routes(tt, *target, route_offsets);
+  write_trips(tt, *target, route_offsets, shapes);
+  write_stop_times(tt, *target, shapes);
+  if (shapes != nullptr) {
+    write_shapes(tt, *target, *shapes);
+  }
+  write_calendar(tt, *target);
+  write_transfers(tt, *target);
+  target->finalize();
+}
+
 }  // namespace nigiri
