@@ -52,13 +52,23 @@ constexpr auto const kDummyAgencyUrl = std::string_view{"https://example.com"};
 gtfs_dir_export_target::gtfs_dir_export_target(std::filesystem::path dir)
     : dir_{std::move(dir)} {
   std::filesystem::create_directories(dir_);
+  utl::verify(std::filesystem::is_empty(dir_),
+              "gtfs export: output directory must be empty: {}", dir_.string());
 }
 
 std::ostream& gtfs_dir_export_target::create_file(std::string const& filename) {
   streams_.push_back(std::make_unique<std::ofstream>(dir_ / filename));
   utl::verify(streams_.back()->is_open(), "gtfs export: cannot create {}",
               (dir_ / filename).string());
+  streams_.back()->exceptions(std::ios::badbit | std::ios::failbit);
   return *streams_.back();
+}
+
+void gtfs_dir_export_target::finalize() {
+  for (auto& s : streams_) {
+    s->flush();
+    s->close();
+  }
 }
 
 namespace {
@@ -66,9 +76,12 @@ std::filesystem::path make_tmp_export_dir(
     std::filesystem::path const& zip_path) {
   auto dir = zip_path;
   dir += ".tmp_export";
-  auto ec = std::error_code{};
-  std::filesystem::remove_all(dir, ec);
-  std::filesystem::create_directories(dir);
+  if (!dir.parent_path().empty()) {
+    std::filesystem::create_directories(dir.parent_path());
+  }
+  utl::verify(std::filesystem::create_directory(dir),
+              "gtfs export: temporary directory already exists: {}",
+              dir.string());
   return dir;
 }
 }  // namespace
@@ -80,7 +93,11 @@ struct gtfs_zip_export_target::impl {
     utl::verify(ok == MZ_TRUE, "gtfs export: cannot create zip archive {}",
                 zip_path.string());
   }
-  ~impl() { mz_zip_writer_end(&ar_); }
+  ~impl() {
+    if (ar_.m_pState != nullptr) {
+      mz_zip_writer_end(&ar_);
+    }
+  }
   impl(impl const&) = delete;
   impl(impl&&) = delete;
   impl& operator=(impl const&) = delete;
@@ -90,11 +107,19 @@ struct gtfs_zip_export_target::impl {
 };
 
 gtfs_zip_export_target::gtfs_zip_export_target(std::filesystem::path zip_path)
-    : zip_path_{std::move(zip_path)},
-      tmp_dir_{make_tmp_export_dir(zip_path_)},
-      impl_{std::make_unique<impl>(zip_path_)} {}
+    : zip_path_{std::move(zip_path)}, tmp_dir_{make_tmp_export_dir(zip_path_)} {
+  try {
+    impl_ = std::make_unique<impl>(tmp_dir_ / "feed.zip");
+  } catch (...) {
+    auto ec = std::error_code{};
+    std::filesystem::remove_all(tmp_dir_, ec);
+    throw;
+  }
+}
 
 gtfs_zip_export_target::~gtfs_zip_export_target() {
+  streams_.clear();
+  impl_.reset();
   auto ec = std::error_code{};
   std::filesystem::remove_all(tmp_dir_, ec);
 }
@@ -104,6 +129,7 @@ std::ostream& gtfs_zip_export_target::create_file(std::string const& filename) {
   streams_.push_back(std::make_unique<std::ofstream>(tmp_dir_ / filename));
   utl::verify(streams_.back()->is_open(), "gtfs export: cannot create {}",
               (tmp_dir_ / filename).string());
+  streams_.back()->exceptions(std::ios::badbit | std::ios::failbit);
   return *streams_.back();
 }
 
@@ -125,9 +151,10 @@ void gtfs_zip_export_target::finalize() {
   auto const ok = mz_zip_writer_finalize_archive(&impl_->ar_);
   utl::verify(ok == MZ_TRUE, "gtfs export: cannot finalize zip archive {}",
               zip_path_.string());
-
-  auto ec = std::error_code{};
-  std::filesystem::remove_all(tmp_dir_, ec);
+  utl::verify(mz_zip_writer_end(&impl_->ar_) == MZ_TRUE,
+              "gtfs export: cannot close zip archive {}", zip_path_.string());
+  impl_.reset();
+  std::filesystem::rename(tmp_dir_ / "feed.zip", zip_path_);
 }
 
 std::unique_ptr<gtfs_export_target> make_gtfs_export_target(
@@ -201,6 +228,67 @@ std::size_t stop_id(location_idx_t const l) {
 std::string station_id(location_idx_t const l, bool const served) {
   return served ? std::format("{}_station", stop_id(l))
                 : std::to_string(stop_id(l));
+}
+
+bool section_flag(timetable const& tt,
+                  route_idx_t const r,
+                  route_flag const flag,
+                  stop_idx_t const section) {
+  auto const flags = tt.route_flags_per_section_[flag][r];
+  return flags.empty() ? tt.is_flag_set(flag, r)
+                       : flags.at(flags.size() == 1U ? 0U : section);
+}
+
+struct exported_trip {
+  transport_idx_t transport_;
+  trip_idx_t trip_;
+  interval<stop_idx_t> stops_;
+  bool split_;
+
+  std::string id() const {
+    return split_ ? std::format("{}_{}", to_idx(transport_), stops_.from_)
+                  : std::to_string(to_idx(transport_));
+  }
+};
+
+template <typename Fn>
+void for_each_exported_trip(timetable const& tt, Fn&& fn) {
+  for (auto t = transport_idx_t{0}; t < tt.transport_traffic_days_.size();
+       ++t) {
+    if (tt.bitfields_[tt.transport_traffic_days_[t]].none()) {
+      continue;
+    }
+    auto const r = tt.transport_route_[t];
+    auto const n_stops =
+        static_cast<stop_idx_t>(tt.route_location_seq_[r].size());
+    auto const sections = tt.transport_to_trip_section_[t];
+    auto const trip_at = [&](stop_idx_t const section) {
+      return tt.merged_trips_[sections.at(sections.size() == 1U ? 0U : section)]
+          .front();
+    };
+    auto const same_flags = [&](stop_idx_t const a, stop_idx_t const b) {
+      for (auto const flag :
+           {kBikesAllowed, kCarsAllowed, kWheelchairAccessible}) {
+        if (section_flag(tt, r, flag, a) != section_flag(tt, r, flag, b)) {
+          return false;
+        }
+      }
+      return true;
+    };
+    auto from = stop_idx_t{0};
+    auto const emit = [&](stop_idx_t const to) {
+      fn(exported_trip{
+          t, trip_at(from), {from, to}, from != 0U || to != n_stops});
+    };
+    for (auto s = stop_idx_t{1}; s < n_stops - 1U; ++s) {
+      if (trip_at(from) != trip_at(s) || !same_flags(from, s)) {
+        // Adjacent trips share the boundary stop.
+        emit(static_cast<stop_idx_t>(s + 1U));
+        from = s;
+      }
+    }
+    emit(n_stops);
+  }
 }
 
 }  // namespace
@@ -336,38 +424,28 @@ void write_stop_times(timetable const& tt, gtfs_export_target& out_target) {
   out << "trip_id,arrival_time,departure_time,stop_id,stop_sequence,"
          "stop_headsign,pickup_type,drop_off_type\n";
 
-  for (auto r = route_idx_t{0}; r < tt.n_routes(); ++r) {
-    auto const stops = tt.route_location_seq_.at(r);
-    auto const transports = tt.route_transport_ranges_.at(r);
-    auto const last = static_cast<stop_idx_t>(stops.size() - 1U);
-
-    for (auto t = transports.from_; t != transports.to_; ++t) {
-      if (tt.bitfields_[tt.transport_traffic_days_[t]].none()) {
-        continue;
-      }
-
-      // Directions are either given once for the whole transport (-> trip
-      // headsign) or per section (section i = stop i -> stop i+1).
-      auto const directions = tt.transport_section_directions_.at(t);
-      auto const per_section_directions = directions.size() > 1U;
-
-      for (auto s = stop_idx_t{0}; s < stops.size(); ++s) {
-        auto const stp = stop{stops[s]};
-        auto const arr =
-            tt.event_mam(t, s, s == 0U ? event_type::kDep : event_type::kArr);
-        auto const dep =
-            tt.event_mam(t, s, s == last ? event_type::kArr : event_type::kDep);
-        auto const headsign = per_section_directions
-                                  ? tt.get_default_translation(
-                                        directions.at(s == last ? s - 1U : s))
-                                  : std::string_view{};
-        out << to_idx(t) << "," << format_time(arr) << "," << format_time(dep)
-            << "," << stop_id(stp.location_idx()) << "," << s << ","
-            << csv_escape(headsign) << "," << (stp.in_allowed() ? 0 : 1) << ","
-            << (stp.out_allowed() ? 0 : 1) << "\n";
-      }
+  for_each_exported_trip(tt, [&](exported_trip const& trip) {
+    auto const t = trip.transport_;
+    auto const stops = tt.route_location_seq_[tt.transport_route_[t]];
+    auto const last = static_cast<stop_idx_t>(trip.stops_.to_ - 1U);
+    auto const id = trip.id();
+    auto const directions = tt.transport_section_directions_[t];
+    for (auto s = trip.stops_.from_; s < trip.stops_.to_; ++s) {
+      auto const stp = stop{stops[s]};
+      auto const arr = tt.event_mam(
+          t, s, s == trip.stops_.from_ ? event_type::kDep : event_type::kArr);
+      auto const dep =
+          tt.event_mam(t, s, s == last ? event_type::kArr : event_type::kDep);
+      auto const headsign = directions.size() > 1U
+                                ? tt.get_default_translation(
+                                      directions.at(s == last ? s - 1U : s))
+                                : std::string_view{};
+      out << id << "," << format_time(arr) << "," << format_time(dep) << ","
+          << stop_id(stp.location_idx()) << "," << (s - trip.stops_.from_)
+          << "," << csv_escape(headsign) << "," << (stp.in_allowed() ? 0 : 1)
+          << "," << (stp.out_allowed() ? 0 : 1) << "\n";
     }
-  }
+  });
 }
 
 void write_trips(timetable const& tt,
@@ -377,52 +455,32 @@ void write_trips(timetable const& tt,
 
   auto& out = out_target.create_file("trips.txt");
   out << "route_id,service_id,trip_id,trip_headsign,trip_short_name,"
-         "wheelchair_accessible,bikes_allowed,cars_allowed\n";
+         "wheelchair_accessible,bikes_allowed,cars_allowed,block_id\n";
 
-  auto const to_global_route_id = [&](source_idx_t s, route_id_idx_t r) {
-    return route_offsets[to_idx(s)] + to_idx(r);
-  };
-
-  for (auto r = route_idx_t{0}; r < tt.n_routes(); ++r) {
-    auto const transport_range = tt.route_transport_ranges_[r];
-    // nigiri does not distinguish "not allowed" from "no information", so
-    // an unset flag is exported as 0 (no information) instead of 2.
+  for_each_exported_trip(tt, [&](exported_trip const& trip) {
+    auto const t = trip.transport_;
+    auto const r = tt.transport_route_[t];
+    // Nigiri does not distinguish "not allowed" from "no information".
     auto const flag = [&](route_flag const f) {
-      return tt.is_flag_set(f, r) ? 1 : 0;
+      return section_flag(tt, r, f, trip.stops_.from_) ? 1 : 0;
     };
-    auto const bikes_allowed = flag(route_flag::kBikesAllowed);
-    auto const cars_allowed = flag(route_flag::kCarsAllowed);
-    auto const wheelchair_accessible = flag(route_flag::kWheelchairAccessible);
-
-    for (auto t = transport_range.from_; t != transport_range.to_; ++t) {
-      if (tt.bitfields_[tt.transport_traffic_days_[t]].none()) {
-        continue;
-      }
-
-      auto const merged_idx = tt.transport_to_trip_section_[t].front();
-      auto const trip_idx = tt.merged_trips_[merged_idx].front();
-      auto const source_id = tt.trip_id_src_[tt.trip_ids_[trip_idx].front()];
-      auto const route_id = tt.trip_route_id_[trip_idx];
-      auto const global_route_id = to_global_route_id(source_id, route_id);
-
-      auto const service_id = to_idx(tt.transport_traffic_days_[t]);
-      auto const trip_id = to_idx(t);
-      auto const short_name =
-          tt.get_default_translation(tt.trip_short_names_[trip_idx]);
-
-      // Per-section directions are exported as stop_headsign, the trip
-      // headsign is the direction of the first section.
-      auto const directions = tt.transport_section_directions_.at(t);
-      auto const headsign = directions.empty()
-                                ? std::string_view{}
-                                : tt.get_default_translation(directions[0]);
-
-      out << global_route_id << "," << service_id << "," << trip_id << ","
-          << csv_escape(headsign) << "," << csv_escape(short_name) << ","
-          << wheelchair_accessible << "," << bikes_allowed << ","
-          << cars_allowed << "\n";
-    }
-  }
+    auto const source_id = tt.trip_id_src_[tt.trip_ids_[trip.trip_].front()];
+    auto const route_id = tt.trip_route_id_[trip.trip_];
+    auto const directions = tt.transport_section_directions_[t];
+    auto const headsign =
+        directions.empty()
+            ? std::string_view{}
+            : tt.get_default_translation(directions.at(
+                  directions.size() == 1U ? 0U : trip.stops_.from_));
+    out << (route_offsets[to_idx(source_id)] + to_idx(route_id)) << ","
+        << to_idx(tt.transport_traffic_days_[t]) << "," << trip.id() << ","
+        << csv_escape(headsign) << ","
+        << csv_escape(
+               tt.get_default_translation(tt.trip_short_names_[trip.trip_]))
+        << "," << flag(kWheelchairAccessible) << "," << flag(kBikesAllowed)
+        << "," << flag(kCarsAllowed) << ","
+        << (trip.split_ ? std::to_string(to_idx(t)) : "") << "\n";
+  });
 }
 
 void write_routes(timetable const& tt,
@@ -445,18 +503,10 @@ void write_routes(timetable const& tt,
                             : route_offsets.back() +
                                   tt.route_ids_.back().ids_.size(),
       false);
-  for (auto r = route_idx_t{0}; r < tt.n_routes(); ++r) {
-    auto const transport_range = tt.route_transport_ranges_[r];
-    for (auto t = transport_range.from_; t != transport_range.to_; ++t) {
-      if (tt.bitfields_[tt.transport_traffic_days_[t]].none()) {
-        continue;
-      }
-      auto const merged_idx = tt.transport_to_trip_section_[t].front();
-      auto const trip_idx = tt.merged_trips_[merged_idx].front();
-      auto const source_id = tt.trip_id_src_[tt.trip_ids_[trip_idx].front()];
-      used[to_global_route_id(source_id, tt.trip_route_id_[trip_idx])] = true;
-    }
-  }
+  for_each_exported_trip(tt, [&](exported_trip const& trip) {
+    auto const source_id = tt.trip_id_src_[tt.trip_ids_[trip.trip_].front()];
+    used[to_global_route_id(source_id, tt.trip_route_id_[trip.trip_])] = true;
+  });
 
   for (auto s = source_idx_t{0}; s < tt.route_ids_.size(); ++s) {
     auto const& routes = tt.route_ids_[s];

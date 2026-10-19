@@ -25,6 +25,7 @@ struct gtfs_dir_export_target : public gtfs_export_target {
   explicit gtfs_dir_export_target(std::filesystem::path dir);
 
   std::ostream& create_file(std::string const& filename) override;
+  void finalize() override;
 
   std::filesystem::path dir_;
   std::vector<std::unique_ptr<std::ofstream>> streams_;

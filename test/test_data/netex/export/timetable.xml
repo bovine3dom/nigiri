@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PublicationDelivery xmlns="http://www.netex.org.uk/netex" version="1.1">
+  <dataObjects>
+    <CompositeFrame id="export">
+      <FrameDefaults>
+        <DefaultLocale><TimeZone>Europe/Berlin</TimeZone></DefaultLocale>
+      </FrameDefaults>
+      <frames>
+        <ResourceFrame id="resources">
+          <organisations>
+            <Operator id="DB"><Name>NeTEx Agency</Name></Operator>
+          </organisations>
+        </ResourceFrame>
+        <ServiceCalendarFrame id="calendar">
+          <ServiceCalendar id="S">
+            <operatingPeriods>
+              <UicOperatingPeriod id="period">
+                <FromDate>2019-05-01</FromDate>
+                <ToDate>2019-05-31</ToDate>
+                <ValidDayBits>1000000000000000000000000000001</ValidDayBits>
+              </UicOperatingPeriod>
+            </operatingPeriods>
+            <dayTypeAssignments>
+              <DayTypeAssignment id="assignment" order="1">
+                <OperatingPeriodRef ref="period"/>
+                <DayTypeRef ref="days"/>
+              </DayTypeAssignment>
+            </dayTypeAssignments>
+          </ServiceCalendar>
+        </ServiceCalendarFrame>
+        <SiteFrame id="sites">
+          <stopPlaces>
+            <StopPlace id="A">
+              <Name>NeTEx A</Name>
+              <Centroid><Location><Longitude>8.7</Longitude><Latitude>49.9</Latitude></Location></Centroid>
+            </StopPlace>
+            <StopPlace id="P">
+              <Name>NeTEx Station</Name>
+              <Centroid><Location><Longitude>8.8</Longitude><Latitude>50.0</Latitude></Location></Centroid>
+              <quays>
+                <Quay id="B">
+                  <Name>NeTEx Platform</Name>
+                  <Centroid><Location><Longitude>8.8001</Longitude><Latitude>50.0001</Latitude></Location></Centroid>
+                </Quay>
+              </quays>
+            </StopPlace>
+          </stopPlaces>
+        </SiteFrame>
+        <ServiceFrame id="network">
+          <lines>
+            <Line id="R1">
+              <Name>NeTEx Route</Name>
+              <ShortName>N1</ShortName>
+              <TransportMode>rail</TransportMode>
+              <additionalOperators><OperatorRef ref="DB"/></additionalOperators>
+            </Line>
+          </lines>
+          <stopAssignments>
+            <PassengerStopAssignment id="first" order="1">
+              <ScheduledStopPointRef ref="pointA"/>
+              <StopPlaceRef ref="A"/>
+            </PassengerStopAssignment>
+            <PassengerStopAssignment id="last" order="2">
+              <ScheduledStopPointRef ref="pointB"/>
+              <StopPlaceRef ref="P"/>
+              <QuayRef ref="B"/>
+            </PassengerStopAssignment>
+          </stopAssignments>
+        </ServiceFrame>
+        <TimetableFrame id="timetable">
+          <vehicleJourneys>
+            <ServiceJourney id="T1">
+              <OperatorRef ref="DB"/>
+              <LineRef ref="R1"/>
+              <TransportMode>rail</TransportMode>
+              <dayTypes><DayTypeRef ref="days"/></dayTypes>
+              <calls>
+                <Call order="1">
+                  <ScheduledStopPointRef ref="pointA"/>
+                  <Departure><Time>23:55:00</Time></Departure>
+                </Call>
+                <Call order="2">
+                  <ScheduledStopPointRef ref="pointB"/>
+                  <Arrival><Time>00:15:00</Time><DayOffset>1</DayOffset></Arrival>
+                </Call>
+              </calls>
+            </ServiceJourney>
+          </vehicleJourneys>
+        </TimetableFrame>
+      </frames>
+    </CompositeFrame>
+  </dataObjects>
+</PublicationDelivery>
