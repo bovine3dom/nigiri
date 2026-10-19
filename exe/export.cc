@@ -17,11 +17,16 @@ int main(int argc, char* argv[]) try {
   auto tt_path = std::filesystem::path{};
   auto gtfs_dir = std::filesystem::path{};
   auto shapes_dir = std::filesystem::path{};
+  auto options = gtfs_export_options{};
 
   auto desc = bpo::options_description{"Allowed options"};
   desc.add_options()("help,h", "produce this help message")  //
       ("tt_path,p", bpo::value(&tt_path)->required(),
        "path to a binary file containing a serialized nigiri timetable")  //
+      ("threads", bpo::value(&options.threads_)->default_value(1),
+       "chunk worker count (1-256); 1 writes tables sequentially")  //
+      ("chunk-size", bpo::value(&options.chunk_size_)->default_value(64),
+       "transports per chunk (1-65536)")  //
       ("shapes", bpo::value(&shapes_dir),
        "shape directory from the same import as the timetable (read-only)")  //
       ("gtfs_export_dir,o", bpo::value(&gtfs_dir)->required(),
@@ -37,6 +42,9 @@ int main(int argc, char* argv[]) try {
   }
 
   bpo::notify(vm);
+  utl::verify(options.threads_ >= 1U && options.threads_ <= 256U &&
+                  options.chunk_size_ >= 1U && options.chunk_size_ <= 65536U,
+              "Invalid export thread count or chunk size");
 
   std::cout << "loading timetable...\n";
   auto tt = nigiri::timetable::read(tt_path);
@@ -62,7 +70,7 @@ int main(int argc, char* argv[]) try {
   }
 
   std::cout << "exporting timetable as GTFS...\n";
-  export_gtfs(*tt, gtfs_dir, shapes.get());
+  export_gtfs(*tt, gtfs_dir, shapes.get(), options);
   std::cout << "done.\n";
 
   return 0;

@@ -1,6 +1,7 @@
 #include "gtest/gtest.h"
 
 #include <chrono>
+#include <array>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -8,6 +9,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 
 #include "nigiri/loader/dir.h"
 #include "nigiri/loader/gtfs/load_timetable.h"
@@ -191,7 +193,15 @@ std::set<std::string> stops(timetable const& tt) {
   return ret;
 }
 
-struct export_gtfs_test : testing::TestWithParam<bool> {
+struct export_gtfs_test : testing::TestWithParam<std::tuple<bool, unsigned>> {
+  bool is_zip() const { return std::get<0>(GetParam()); }
+
+  void export_gtfs(timetable const& tt,
+                   std::filesystem::path const& path,
+                   shapes_storage const* shapes = nullptr) const {
+    nigiri::export_gtfs(tt, path, shapes, {std::get<1>(GetParam()), 1});
+  }
+
   void SetUp() override {
     auto const root =
         std::filesystem::temp_directory_path() /
@@ -209,7 +219,7 @@ struct export_gtfs_test : testing::TestWithParam<bool> {
   }
 
   std::filesystem::path output() const {
-    return root_ / (GetParam() ? "feed.ZIP" : "feed");
+    return root_ / (is_zip() ? "feed.ZIP" : "feed");
   }
 
   std::filesystem::path root_;
@@ -502,8 +512,39 @@ TEST_P(export_gtfs_test, utc_service_dates) {
   }
 }
 
+TEST_P(export_gtfs_test, source_files) {
+  auto tt = load(loader::mem_dir::read(kFeed));
+  ASSERT_EQ(2U, tt.n_trips());
+  auto const names = std::array{"feeds/one.gtfs.zip/stop_times.txt",
+                                "feeds/two, \"quoted\".xml"};
+  for (auto trip = trip_idx_t{0}; trip != tt.n_trips(); ++trip) {
+    tt.trip_debug_[trip].front().source_file_idx_ =
+        tt.register_source_file(names[to_idx(trip)]);
+  }
+  export_gtfs(tt, output());
+  EXPECT_EQ(
+      "attribution_id,route_id,organization_name,is_producer,attribution_url\n"
+      "nigiri:0:0:0,0,feeds/one.gtfs.zip/stop_times.txt,1,\n"
+      "nigiri:0:0:1,0,\"feeds/two, \"\"quoted\"\".xml\",1,\n"
+      "nigiri:0:1:0,1,feeds/one.gtfs.zip/stop_times.txt,1,\n"
+      "nigiri:0:1:1,1,\"feeds/two, \"\"quoted\"\".xml\",1,\n",
+      loader::make_dir(output())->get_file("attributions.txt").data());
+
+  for (auto trip = trip_idx_t{0}; trip != tt.n_trips(); ++trip) {
+    tt.trip_debug_[trip].clear();
+  }
+  auto const path = root_ / "missing" / output().filename();
+  export_gtfs(tt, path);
+  EXPECT_EQ(
+      "attribution_id,route_id,organization_name,is_producer,attribution_url\n"
+      "nigiri:0:0:0,0,unknown-source-0,1,\n"
+      "nigiri:0:1:0,1,unknown-source-0,1,\n",
+      loader::make_dir(path)->get_file("attributions.txt").data());
+}
+
 TEST_P(export_gtfs_test, colliding_source_ids) {
-  auto const first = loader::mem_dir::read(kFeed);
+  auto first = loader::mem_dir::read(kFeed);
+  first.dir_["routes.txt"] += "UNUSED,DB,Unused,,3,,\n";
   for (auto const identical : {false, true}) {
     SCOPED_TRACE(identical);
     auto second = first;
@@ -527,13 +568,28 @@ TEST_P(export_gtfs_test, colliding_source_ids) {
     auto bitfields = hash_map<bitfield, bitfield_idx_t>{};
     loader::gtfs::load_timetable({}, source_idx_t{0}, first, tt, bitfields);
     loader::gtfs::load_timetable({}, source_idx_t{1}, second, tt, bitfields);
+    for (auto trip = trip_idx_t{0}; trip != tt.n_trips(); ++trip) {
+      auto const source = tt.trip_id_src_[tt.trip_ids_[trip].front()];
+      tt.trip_debug_[trip].front().source_file_idx_ = tt.register_source_file(
+          to_idx(source) == 0U ? "fr_sncf_voyageurs.gtfs.zip/stop_times.txt"
+                               : "be_sncb.gtfs.zip/stop_times.txt");
+    }
     loader::finalize(tt);
     EXPECT_EQ(expected, trip_events(tt));
 
     auto const path =
         root_ / (identical ? "identical" : "different") / output().filename();
     export_gtfs(tt, path);
-    auto const tt2 = load(*loader::make_dir(path));
+    auto const exported = loader::make_dir(path);
+    EXPECT_EQ(
+        "attribution_id,route_id,organization_name,is_producer,attribution_"
+        "url\n"
+        "nigiri:0:0:0,0,fr_sncf_voyageurs.gtfs.zip/stop_times.txt,1,\n"
+        "nigiri:0:1:0,1,fr_sncf_voyageurs.gtfs.zip/stop_times.txt,1,\n"
+        "nigiri:1:3:0,3,be_sncb.gtfs.zip/stop_times.txt,1,\n"
+        "nigiri:1:4:0,4,be_sncb.gtfs.zip/stop_times.txt,1,\n",
+        exported->get_file("attributions.txt").data());
+    auto const tt2 = load(*exported);
     EXPECT_EQ(expected, trip_events(tt2));
     EXPECT_EQ(stops(tt), stops(tt2));
   }
@@ -641,7 +697,14 @@ TEST_P(export_gtfs_test, through_service) {
     ASSERT_EQ(23U, expected.size());
     auto const path = root_ / std::to_string(hour) / output().filename();
     export_gtfs(tt, path);
-    auto const tt2 = load(*loader::make_dir(path));
+    auto const exported = loader::make_dir(path);
+    EXPECT_EQ(
+        "attribution_id,route_id,organization_name,is_producer,attribution_"
+        "url\n"
+        "nigiri:0:0:0,0,::memory::/stop_times.txt,1,\n"
+        "nigiri:0:1:0,1,::memory::/stop_times.txt,1,\n",
+        exported->get_file("attributions.txt").data());
+    auto const tt2 = load(*exported);
     EXPECT_EQ(2U, tt2.trip_ids_.size());
     EXPECT_EQ(expected, trip_events(tt2));
 
@@ -671,6 +734,11 @@ TEST_P(export_gtfs_test, through_service) {
     auto const shaped_path =
         root_ / std::format("shaped-{}", hour) / output().filename();
     export_gtfs(tt, shaped_path, &shapes);
+    auto const credit_dir = loader::make_dir(shaped_path);
+    auto const credits = credit_dir->get_file("attributions.txt");
+    EXPECT_NE(std::string_view::npos,
+              credits.data().find("osm,,OpenStreetMap contributors,1,"
+                                  "https://www.openstreetmap.org/copyright\n"));
     auto imported_shapes =
         shapes_storage{root_ / std::format("imported-shapes-{}", hour),
                        cista::mmap::protection::WRITE};
@@ -731,15 +799,15 @@ TEST_P(export_gtfs_test, write_failure) {
   EXPECT_THROW(target->finalize(), std::ios_base::failure);
   target.reset();
   EXPECT_FALSE(std::filesystem::exists(output().string() + ".tmp_export"));
-  if (GetParam()) {
+  if (is_zip()) {
     EXPECT_FALSE(std::filesystem::exists(output()));
   }
 }
 
 TEST_P(export_gtfs_test, preserve_existing_files) {
   auto const reserved =
-      GetParam() ? std::filesystem::path{output().string() + ".tmp_export"}
-                 : output();
+      is_zip() ? std::filesystem::path{output().string() + ".tmp_export"}
+               : output();
   std::filesystem::create_directory(reserved);
   auto const sentinel = reserved / "shapes.txt";
   {
@@ -761,7 +829,7 @@ TEST_P(export_gtfs_test, directory_zip_equivalence) {
   auto shapes =
       shapes_storage{root_ / "shapes", cista::mmap::protection::WRITE};
   add_shared_shape(tt, shapes, {{49.0, 8.0}, {50.0, 8.0}, {51.0, 8.0}});
-  auto const storage = GetParam() ? &shapes : nullptr;
+  auto const storage = is_zip() ? &shapes : nullptr;
   export_gtfs(tt, directory, storage);
   export_gtfs(tt, zip, storage);
   auto const files = loader::fs_dir{directory};
@@ -774,7 +842,7 @@ TEST_P(export_gtfs_test, directory_zip_equivalence) {
 }
 
 TEST_P(export_gtfs_test, incomplete_zip_preserves_previous_export) {
-  if (!GetParam()) {
+  if (!is_zip()) {
     GTEST_SKIP() << "ZIP publication test";
   }
   auto const tt = load(loader::mem_dir::read(kFeed));
@@ -790,4 +858,46 @@ TEST_P(export_gtfs_test, incomplete_zip_preserves_previous_export) {
   EXPECT_EQ(trip_events(tt), trip_events(load(loader::zip_dir{output()})));
 }
 
-INSTANTIATE_TEST_SUITE_P(directory_and_zip, export_gtfs_test, testing::Bool());
+TEST_P(export_gtfs_test, parallel_bytes_match_serial) {
+  auto feed = loader::mem_dir::read(kFeed);
+  feed.dir_["frequencies.txt"] =
+      "trip_id,start_time,end_time,headway_secs,exact_times\n"
+      "T1,09:00:00,21:00:00,600,1\n";
+  auto const tt = load(feed);
+  ASSERT_GT(tt.transport_traffic_days_.size(), 32U);
+  auto shapes =
+      shapes_storage{root_ / "shapes", cista::mmap::protection::WRITE};
+  add_shared_shape(tt, shapes, {{49.0, 8.0}, {50.0, 8.0}, {51.0, 8.0}});
+  for (auto const shaped : {false, true}) {
+    auto const storage = shaped ? &shapes : nullptr;
+    auto const reference = root_ / (shaped ? "serial-shaped" : "serial");
+    nigiri::export_gtfs(tt, reference, storage);
+    auto const expected = loader::fs_dir{reference};
+    for (auto const chunk : {1U, 7U, 64U}) {
+      auto const path = root_ / std::format("parallel-{}-{}{}", shaped, chunk,
+                                            is_zip() ? ".zip" : "");
+      nigiri::export_gtfs(tt, path, storage, {4, chunk});
+      auto const actual = loader::make_dir(path);
+      ASSERT_EQ(expected.list_files({}).size(), actual->list_files({}).size());
+      for (auto const& file : expected.list_files({})) {
+        EXPECT_EQ(expected.get_file(file).data(), actual->get_file(file).data())
+            << file << " chunk=" << chunk;
+      }
+    }
+  }
+}
+
+TEST_P(export_gtfs_test, invalid_parallel_options_create_no_output) {
+  auto const tt = load(loader::mem_dir::read(kFeed));
+  for (auto const options :
+       {gtfs_export_options{0, 1}, {257, 1}, {4, 0}, {4, 65537}}) {
+    EXPECT_ANY_THROW(nigiri::export_gtfs(tt, output(), nullptr, options));
+    EXPECT_FALSE(std::filesystem::exists(output()));
+    EXPECT_FALSE(std::filesystem::exists(output().string() + ".tmp_export"));
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(directory_and_zip,
+                         export_gtfs_test,
+                         testing::Combine(testing::Bool(),
+                                          testing::Values(1U, 4U)));

@@ -1,8 +1,10 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -26,6 +28,7 @@ struct gtfs_dir_export_target : public gtfs_export_target {
   std::ostream& create_file(std::string const& filename) override;
   void finalize() override;
 
+  std::mutex mutex_;
   std::filesystem::path dir_;
   std::vector<std::unique_ptr<std::ofstream>> streams_;
 };
@@ -42,6 +45,7 @@ struct gtfs_zip_export_target : public gtfs_export_target {
   std::ostream& create_file(std::string const& filename) override;
   void finalize() override;
 
+  std::mutex mutex_;
   std::filesystem::path zip_path_;
   std::filesystem::path tmp_dir_;
   std::vector<std::string> filenames_;
@@ -54,8 +58,14 @@ struct gtfs_zip_export_target : public gtfs_export_target {
 std::unique_ptr<gtfs_export_target> make_gtfs_export_target(
     std::filesystem::path const& output_path);
 
+struct gtfs_export_options {
+  unsigned threads_{1};
+  std::size_t chunk_size_{64};
+};
+
 void export_gtfs(timetable const& tt,
                  std::filesystem::path const& output_path,
-                 shapes_storage const* shapes = nullptr);
+                 shapes_storage const* shapes = nullptr,
+                 gtfs_export_options const& options = {});
 
 }  // namespace nigiri

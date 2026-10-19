@@ -9,10 +9,19 @@
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <set>
+#include <sstream>
+#include <syncstream>
+
+#include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include "parallel.h"
 
 #include "shape.h"
 
@@ -30,7 +39,7 @@ namespace {
 struct progress_timer {
   explicit progress_timer(std::string label)
       : label_{std::move(label)}, start_{std::chrono::steady_clock::now()} {
-    std::cout << "writing " << label_ << " ... " << std::flush;
+    std::osyncstream{std::cout} << "writing " << label_ << "\n";
   }
   progress_timer(progress_timer const&) = delete;
   progress_timer(progress_timer&&) = delete;
@@ -41,7 +50,8 @@ struct progress_timer {
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start_)
             .count();
-    std::cout << "done. (" << elapsed_ms << "ms)\n";
+    std::osyncstream{std::cout} << label_ << " finished (" << elapsed_ms
+                                << "ms)\n";
   }
 
   std::string label_;
@@ -62,6 +72,7 @@ gtfs_dir_export_target::gtfs_dir_export_target(std::filesystem::path dir)
 }
 
 std::ostream& gtfs_dir_export_target::create_file(std::string const& filename) {
+  auto const lock = std::lock_guard{mutex_};
   streams_.push_back(std::make_unique<std::ofstream>(dir_ / filename));
   utl::verify(streams_.back()->is_open(), "gtfs export: cannot create {}",
               (dir_ / filename).string());
@@ -130,6 +141,7 @@ gtfs_zip_export_target::~gtfs_zip_export_target() {
 }
 
 std::ostream& gtfs_zip_export_target::create_file(std::string const& filename) {
+  auto const lock = std::lock_guard{mutex_};
   filenames_.push_back(filename);
   streams_.push_back(std::make_unique<std::ofstream>(tmp_dir_ / filename));
   utl::verify(streams_.back()->is_open(), "gtfs export: cannot create {}",
@@ -257,9 +269,14 @@ struct exported_trip {
 };
 
 template <typename Fn>
-void for_each_exported_trip(timetable const& tt, Fn&& fn) {
-  for (auto t = transport_idx_t{0}; t < tt.transport_traffic_days_.size();
-       ++t) {
+void for_each_exported_trip(
+    timetable const& tt,
+    Fn&& fn,
+    std::size_t const from_transport = 0,
+    std::size_t const to_transport = std::numeric_limits<std::size_t>::max()) {
+  auto const end =
+      std::min<std::size_t>(to_transport, tt.transport_traffic_days_.size());
+  for (auto t = transport_idx_t{from_transport}; t < end; ++t) {
     if (tt.bitfields_[tt.transport_traffic_days_[t]].none()) {
       continue;
     }
@@ -296,6 +313,24 @@ void for_each_exported_trip(timetable const& tt, Fn&& fn) {
   }
 }
 
+template <typename Fn>
+void parallel_trip_rows(timetable const& tt,
+                        gtfs_export::worker_pool& pool,
+                        gtfs_export_options const& options,
+                        std::ostream& out,
+                        Fn fn) {
+  gtfs_export::ordered_chunks(
+      pool, tt.transport_traffic_days_.size(), options.chunk_size_,
+      [&](std::size_t from, std::size_t to) {
+        auto buffer = std::ostringstream{};
+        buffer.exceptions(std::ios::badbit | std::ios::failbit);
+        for_each_exported_trip(
+            tt, [&](exported_trip const& trip) { fn(trip, buffer); }, from, to);
+        return std::move(buffer).str();
+      },
+      [&](std::string const& chunk) { out << chunk; });
+}
+
 gtfs_export::shape_slice shape_for(timetable const& tt,
                                    shapes_storage const* shapes,
                                    exported_trip const& trip) {
@@ -317,46 +352,104 @@ std::string format_decimal(double const value) {
 
 void write_shapes(timetable const& tt,
                   gtfs_export_target& target,
-                  shapes_storage const& shapes) {
+                  shapes_storage const& shapes,
+                  gtfs_export::worker_pool& pool,
+                  gtfs_export_options const& options) {
   auto const timer = progress_timer{"shapes.txt"};
   auto& out = target.create_file("shapes.txt");
   out << "shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence,"
          "shape_dist_traveled\n";
-  auto seen = std::unordered_set<std::string>{};
   using enum gtfs_export::shape_status;
-  auto counts = std::map<gtfs_export::shape_status, std::size_t>{};
-  auto publisher = std::size_t{0};
-  auto routed = std::size_t{0};
-  auto without_distances = std::size_t{0};
-  for_each_exported_trip(tt, [&](exported_trip const& trip) {
-    auto const shape = shape_for(tt, &shapes, trip);
-    ++counts[shape.status_];
-    if (shape.status_ != kValid) {
-      return;
-    }
-    ++(get_shape_source(shape.source_) == shape_source::kRouted ? routed
-                                                                : publisher);
-    without_distances += shape.stop_distances_.empty() ? 1U : 0U;
-    if (!seen.emplace(shape.id_).second) {
-      return;
-    }
-    auto seq = 0U;
-    for (auto i = 0U; i != shape.points_.size(); ++i) {
-      // Keep distances strictly increasing without changing stop offsets.
-      if (i != 0U && shape.distances_[i] == shape.distances_[i - 1U]) {
-        continue;
-      }
-      auto const p = shape.points_[i];
-      out << std::format("{},{},{},{},{}\n", shape.id_, format_decimal(p.lat_),
-                         format_decimal(p.lng_), seq++,
-                         format_decimal(shape.distances_[i]));
-    }
-  });
-  std::cout << std::format(
+  struct chunk {
+    std::vector<std::string> ids_;
+    std::map<gtfs_export::shape_status, std::size_t> counts_;
+    std::size_t publisher_{0}, routed_{0}, without_distances_{0};
+  };
+  auto totals = chunk{};
+  auto n_shapes = std::size_t{0};
+  auto registry_mutex = std::mutex{};
+  auto registry =
+      std::unordered_map<std::string, std::shared_future<std::string>>{};
+  gtfs_export::ordered_chunks(
+      pool, tt.transport_traffic_days_.size(), options.chunk_size_,
+      [&](std::size_t from, std::size_t to) {
+        auto result = chunk{};
+        auto local_seen = std::unordered_set<std::string>{};
+        for_each_exported_trip(
+            tt,
+            [&](exported_trip const& trip) {
+              auto const shape = shape_for(tt, &shapes, trip);
+              ++result.counts_[shape.status_];
+              if (shape.status_ != kValid) {
+                return;
+              }
+              ++(get_shape_source(shape.source_) == shape_source::kRouted
+                     ? result.routed_
+                     : result.publisher_);
+              result.without_distances_ +=
+                  shape.stop_distances_.empty() ? 1U : 0U;
+              if (!local_seen.emplace(shape.id_).second) {
+                return;
+              }
+              auto promise = std::optional<std::promise<std::string>>{};
+              {
+                auto lock = std::lock_guard{registry_mutex};
+                auto const [it, inserted] = registry.try_emplace(shape.id_);
+                if (inserted) {
+                  promise.emplace();
+                  it->second = promise->get_future().share();
+                } else if (!it->second.valid()) {
+                  return;  // Already written by the ordered reducer.
+                }
+              }
+              result.ids_.push_back(shape.id_);
+              if (!promise) {
+                return;  // Another worker formats this geometry.
+              }
+              auto rows = std::string{};
+              auto seq = 0U;
+              for (auto i = 0U; i != shape.points_.size(); ++i) {
+                if (i != 0U &&
+                    shape.distances_[i] == shape.distances_[i - 1U]) {
+                  continue;
+                }
+                auto const p = shape.points_[i];
+                rows +=
+                    std::format("{},{},{},{},{}\n", shape.id_,
+                                format_decimal(p.lat_), format_decimal(p.lng_),
+                                seq++, format_decimal(shape.distances_[i]));
+              }
+              promise->set_value(std::move(rows));
+            },
+            from, to);
+        return result;
+      },
+      [&](chunk const& result) {
+        for (auto const& [status, count] : result.counts_) {
+          totals.counts_[status] += count;
+        }
+        totals.publisher_ += result.publisher_;
+        totals.routed_ += result.routed_;
+        totals.without_distances_ += result.without_distances_;
+        for (auto const& id : result.ids_) {
+          // Retain first-use order and release geometry after its first write.
+          auto rows = std::shared_future<std::string>{};
+          {
+            auto lock = std::lock_guard{registry_mutex};
+            rows = std::exchange(registry.at(id), {});
+          }
+          if (rows.valid()) {
+            out << rows.get();
+            ++n_shapes;
+          }
+        }
+      });
+  std::osyncstream{std::cout} << std::format(
       "trips: {} publisher, {} routed, {} missing; omitted: {} trip range, "
-      "{} offsets, {} geometry; {} shapes, {} trips without stop distances. ",
-      publisher, routed, counts[kMissing], counts[kTripRange], counts[kOffsets],
-      counts[kGeometry], seen.size(), without_distances);
+      "{} offsets, {} geometry; {} shapes, {} trips without stop distances.\n",
+      totals.publisher_, totals.routed_, totals.counts_[kMissing],
+      totals.counts_[kTripRange], totals.counts_[kOffsets],
+      totals.counts_[kGeometry], n_shapes, totals.without_distances_);
 }
 
 void write_feed_info(gtfs_export_target& out_target) {
@@ -461,7 +554,9 @@ void write_stops(timetable const& tt, gtfs_export_target& out_target) {
 
 void write_stop_times(timetable const& tt,
                       gtfs_export_target& out_target,
-                      shapes_storage const* shapes) {
+                      shapes_storage const* shapes,
+                      gtfs_export::worker_pool& pool,
+                      gtfs_export_options const& options) {
   auto const timer = progress_timer{"stop_times.txt"};
 
   auto& out = out_target.create_file("stop_times.txt");
@@ -469,7 +564,7 @@ void write_stop_times(timetable const& tt,
          "stop_headsign,pickup_type,drop_off_type";
   out << (shapes != nullptr ? ",shape_dist_traveled\n" : "\n");
 
-  for_each_exported_trip(tt, [&](exported_trip const& trip) {
+  auto const write = [&](exported_trip const& trip, std::ostream& out) {
     auto const shape = shape_for(tt, shapes, trip);
     auto const t = trip.transport_;
     auto const stops = tt.route_location_seq_[tt.transport_route_[t]];
@@ -499,13 +594,16 @@ void write_stop_times(timetable const& tt,
       }
       out << "\n";
     }
-  });
+  };
+  parallel_trip_rows(tt, pool, options, out, write);
 }
 
 void write_trips(timetable const& tt,
                  gtfs_export_target& out_target,
                  std::vector<size_t> const& route_offsets,
-                 shapes_storage const* shapes) {
+                 shapes_storage const* shapes,
+                 gtfs_export::worker_pool& pool,
+                 gtfs_export_options const& options) {
   auto const timer = progress_timer{"trips.txt"};
 
   auto& out = out_target.create_file("trips.txt");
@@ -513,7 +611,7 @@ void write_trips(timetable const& tt,
          "wheelchair_accessible,bikes_allowed,cars_allowed,block_id";
   out << (shapes != nullptr ? ",shape_id\n" : "\n");
 
-  for_each_exported_trip(tt, [&](exported_trip const& trip) {
+  auto const write = [&](exported_trip const& trip, std::ostream& out) {
     auto const t = trip.transport_;
     auto const r = tt.transport_route_[t];
     // Nigiri does not distinguish "not allowed" from "no information".
@@ -543,15 +641,26 @@ void write_trips(timetable const& tt,
                                                                  : "");
     }
     out << "\n";
-  });
+  };
+  parallel_trip_rows(tt, pool, options, out, write);
 }
 
 void write_routes(timetable const& tt,
                   gtfs_export_target& out_target,
-                  std::vector<size_t> const& route_offsets) {
+                  bool const include_shape_credit,
+                  std::vector<size_t> const& route_offsets,
+                  gtfs_export::worker_pool& pool,
+                  gtfs_export_options const& options) {
   auto const timer = progress_timer{"routes.txt"};
 
   auto& out = out_target.create_file("routes.txt");
+  auto& attributions = out_target.create_file("attributions.txt");
+  attributions << "attribution_id,route_id,organization_name,is_producer,"
+                  "attribution_url\n";
+  if (include_shape_credit) {
+    attributions << "osm,,OpenStreetMap contributors,1,"
+                    "https://www.openstreetmap.org/copyright\n";
+  }
 
   auto const to_global_route_id = [&](source_idx_t s, route_id_idx_t r) {
     return route_offsets[to_idx(s)] + to_idx(r);
@@ -562,14 +671,43 @@ void write_routes(timetable const& tt,
 
   // Only export routes referenced by at least one exported trip.
   auto used = std::vector<bool>(
-      route_offsets.empty() ? 0U
-                            : route_offsets.back() +
-                                  tt.route_ids_.back().ids_.size(),
+      route_offsets.empty()
+          ? 0U
+          : route_offsets.back() + tt.route_ids_.back().ids_.size(),
       false);
-  for_each_exported_trip(tt, [&](exported_trip const& trip) {
-    auto const source_id = tt.trip_id_src_[tt.trip_ids_[trip.trip_].front()];
-    used[to_global_route_id(source_id, tt.trip_route_id_[trip.trip_])] = true;
-  });
+  auto source_files = std::set<std::pair<source_idx_t, std::string_view>>{};
+  struct route_chunk {
+    std::set<std::size_t> used_;
+    std::set<std::pair<source_idx_t, std::string_view>> files_;
+  };
+  gtfs_export::ordered_chunks(
+      pool, tt.transport_traffic_days_.size(), options.chunk_size_,
+      [&](std::size_t from, std::size_t to) {
+        auto result = route_chunk{};
+        for_each_exported_trip(
+            tt,
+            [&](exported_trip const& trip) {
+              auto const source =
+                  tt.trip_id_src_[tt.trip_ids_[trip.trip_].front()];
+              result.used_.insert(
+                  to_global_route_id(source, tt.trip_route_id_[trip.trip_]));
+              auto const debug = tt.trip_debug_[trip.trip_];
+              result.files_.emplace(
+                  source,
+                  debug.empty()
+                      ? std::string_view{}
+                      : tt.source_file_names_[debug.front().source_file_idx_]
+                            .view());
+            },
+            from, to);
+        return result;
+      },
+      [&](route_chunk const& chunk) {
+        for (auto const route : chunk.used_) {
+          used[route] = true;
+        }
+        source_files.insert(begin(chunk.files_), end(chunk.files_));
+      });
 
   for (auto s = source_idx_t{0}; s < tt.route_ids_.size(); ++s) {
     auto const& routes = tt.route_ids_[s];
@@ -601,6 +739,18 @@ void write_routes(timetable const& tt,
       out << global_id << "," << agency << "," << csv_escape(short_name) << ","
           << csv_escape(long_name) << "," << type << "," << color_str << ","
           << text_str << "\n";
+      auto file_index = std::size_t{0};
+      for (auto it = source_files.lower_bound({s, std::string_view{}});
+           it != end(source_files) && it->first == s; ++it) {
+        auto const file = it->second;
+        attributions << "nigiri:" << to_idx(s) << ":" << global_id << ":"
+                     << file_index++ << "," << global_id << ","
+                     << csv_escape(
+                            file.empty()
+                                ? std::format("unknown-source-{}", to_idx(s))
+                                : std::string{file})
+                     << ",1,\n";
+      }
     }
   }
 }
@@ -731,7 +881,11 @@ void write_calendar(timetable const& tt, gtfs_export_target& out_target) {
 
 void export_gtfs(timetable const& tt,
                  std::filesystem::path const& output_path,
-                 shapes_storage const* shapes) {
+                 shapes_storage const* shapes,
+                 gtfs_export_options const& options) {
+  utl::verify(options.threads_ >= 1U && options.threads_ <= 256U &&
+                  options.chunk_size_ >= 1U && options.chunk_size_ <= 65536U,
+              "Invalid export thread count or chunk size");
   auto target = make_gtfs_export_target(output_path);
   auto route_offsets = std::vector<std::size_t>(tt.route_ids_.size());
   auto sum = std::size_t{0};
@@ -740,17 +894,48 @@ void export_gtfs(timetable const& tt,
     sum += tt.route_ids_[s].ids_.size();
   }
 
-  write_feed_info(*target);
-  write_agencies(tt, *target);
-  write_stops(tt, *target);
-  write_routes(tt, *target, route_offsets);
-  write_trips(tt, *target, route_offsets, shapes);
-  write_stop_times(tt, *target, shapes);
-  if (shapes != nullptr) {
-    write_shapes(tt, *target, *shapes);
+  auto pool = gtfs_export::worker_pool{options.threads_};
+  auto writers = std::vector<std::future<void>>{};
+  auto const launch = [&](auto fn) {
+    auto work = [&, fn] {
+      try {
+        pool.check();
+        fn();
+      } catch (...) {
+        pool.fail(std::current_exception());
+      }
+    };
+    if (options.threads_ == 1U) {
+      work();
+    } else {
+      writers.emplace_back(std::async(std::launch::async, work));
+    }
+  };
+  try {
+    launch([&] {
+      write_feed_info(*target);
+      write_agencies(tt, *target);
+      write_stops(tt, *target);
+      write_routes(tt, *target, shapes != nullptr, route_offsets, pool,
+                   options);
+      pool.check();
+      write_calendar(tt, *target);
+      write_transfers(tt, *target);
+    });
+    launch([&] {
+      write_trips(tt, *target, route_offsets, shapes, pool, options);
+    });
+    launch([&] { write_stop_times(tt, *target, shapes, pool, options); });
+    if (shapes != nullptr) {
+      launch([&] { write_shapes(tt, *target, *shapes, pool, options); });
+    }
+  } catch (...) {
+    pool.fail(std::current_exception());
   }
-  write_calendar(tt, *target);
-  write_transfers(tt, *target);
+  for (auto& writer : writers) {
+    writer.get();
+  }
+  pool.check();
   target->finalize();
 }
 
